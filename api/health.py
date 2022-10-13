@@ -18,7 +18,7 @@ def list_suspicious_objects(host, api_token):
     """Query Trend Micro Vision One API List suspicious objects API for 1 object
     https://automation.trendmicro.com/xdr/api-v3#tag/Suspicious-Object-List/paths/~1v3.0~1threatintel~1suspiciousObjects/get
     """
-    url = f"https://{host}/v3.0/threatintel/suspiciousObjects?top 1"
+    url = f"https://{host}/v3.0/threatintel/suspiciousObjects?top=1"
     headers = {"Authorization": f"Bearer {api_token}"}
     # data = {"data": {"apiToken": f"{api_token}"}}
     response = requests.get(url, headers=headers)
