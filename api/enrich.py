@@ -1,4 +1,5 @@
 import requests
+import ipaddress
 import urllib.parse
 from functools import partial
 from datetime import datetime, timezone, timedelta
@@ -50,6 +51,58 @@ def group_observables(relay_input):
     return result
 
 
+def get_endpoint_data_by_agent_guid(host, api_token, agent_guid):
+    """https://automation.trendmicro.com/xdr/api-v3#tag/Search/paths/~1v3.0~1eiqs~1endpoints/get"""
+    url = f"https://{host}/v3.0/eiqs/endpoints"
+
+    headers = {
+        "TMV1-Query": f"agentGuid eq '{agent_guid}'",
+        "Authorization": f"Bearer {api_token}",
+    }
+
+    response = requests.get(url, headers=headers)
+
+    if response.ok:
+        return response.json()
+
+
+def build_target_from_endpoint_obj(message, eventTimeDT):
+    def get_ip_type(address):
+        try:
+            ip = ipaddress.ip_address(address)
+
+            if isinstance(ip, ipaddress.IPv4Address):
+                return "ip"
+
+            if isinstance(ip, ipaddress.IPv6Address):
+                return "ipv6"
+        except ValueError:
+            print(f"{address} is an invalid IP address")
+
+    message = message.get("items", [])[0]
+    macAddress = message.get("macAddress", {}).get("value")
+    ips = message.get("ip", {}).get("value")
+    endpointName = message.get("endpointName", {}).get("value")
+
+    target = {
+        "type": "endpoint",
+        "observables": [],
+        "observed_time": {"start_time": eventTimeDT, "end_time": eventTimeDT},
+        "os": message.get("osName", "MISSING"),
+    }
+
+    if endpointName:
+        target["observables"].append({"value": endpointName, "type": "hostname"})
+
+    for value in macAddress:
+        target["observables"].append({"value": value, "type": "mac_address"})
+
+    for value in ips:
+        target["observables"].append({"value": value, "type": get_ip_type(value)})
+
+    return target
+
+
 def get_detection_data(host, api_token, observable):
     url = f"https://{host}/v3.0/search/detections"
 
@@ -60,7 +113,7 @@ def get_detection_data(host, api_token, observable):
 
     params = {"startDateTime": startDateTime, "top": 100}
     headers = {
-        "TMV1-Query": observable,
+        "TMV1-Query": f"{observable}",
         "Authorization": f"Bearer {api_token}",
     }
 
@@ -84,6 +137,71 @@ def get_vision_one_outputs(host, api_token, observables):
     return outputs
 
 
+def extract_sightings(output, observable, host, api_token):
+    """Parse Trend Micro Vision One detection object and build CTIM Sighting
+    Detection Object from: Get detection data API
+    URL: https://automation.trendmicro.com/xdr/api-v3#tag/Search/paths/~1v3.0~1search~1detections/get
+    """
+
+    def _make_data_table(message):
+        data = {"columns": [], "rows": [[]]}
+
+        for key, value in message.items():
+            if (
+                not (key.startswith(("rt", "rt_utc", "eventTime", "eventTimeDT")))
+                and value
+            ):
+                data["columns"].append({"name": key, "type": "string"})
+                data["rows"][0].append(str(value))
+
+        return data
+
+    eventTime = output.get("eventTime")
+    eventTimeDT = output.get("eventTimeDT")
+    uuid = output.get("uuid")
+    endpointGUID = output.get("endpointGUID")
+    endpointHostName = output.get("endpointHostName")
+
+    doc = {
+        "confidence": "High",
+        "count": 1,
+        "description": "Vision One Detection",
+        "short_description": f"{output.get('eventName')} - {output.get('eventSubName')}",
+        "external_ids": [uuid],
+        "id": f"transient:sighting-{uuid}",
+        "internal": True,
+        "observables": [observable],
+        "observed_time": {"start_time": eventTimeDT},
+        "data": _make_data_table(output),
+        # "relations": [],
+        "schema_version": "1.1.12",
+        # "sensor": "endpoint",
+        # "severity": "string",
+        "source": "Vision One Detection",
+        "source_uri": f"https://{host.replace('api', 'portal')}/index.html#/app/search?action=new_search&search_type=uuid&search_value={uuid}&search_source=detection&start={eventTime-3600}&end={eventTime+3600}",
+        "type": "sighting",
+    }
+
+    # doc["relations"].extend(extract_relations(threatInfo, observable))
+
+    if endpointGUID and endpointHostName:
+        # endpoint_data = get_endpoint_data_by_agent_guid(host, api_token, endpointGUID)
+        # target = build_target_from_endpoint_obj(endpoint_data, eventTimeDT)
+        # print(target)
+
+        target = {
+            "type": "endpoint",
+            "observables": [{"value": endpointHostName, "type": "hostname"}],
+            "observed_time": {"start_time": eventTimeDT},
+            # "observed_time": {"start_time": eventTimeDT, "end_time": eventTimeDT},
+            # "os": message.get("osName", "MISSING"),
+        }
+
+        doc.setdefault("targets", []).append(target)
+
+    return doc
+
+
 @enrich_api.route("/deliberate/observables", methods=["POST"])
 def deliberate_observables():
     _ = get_jwt()
@@ -97,15 +215,35 @@ def observe_observables():
     host = jwt["host"]
     api_token = jwt["token"]
     observables = group_observables(get_observables())
-    print(observables)
 
     if not observables:
         return jsonify_data({})
 
     vision_one_outputs = get_vision_one_outputs(host, api_token, observables)
 
-    return vision_one_outputs
+    if not vision_one_outputs:
+        return jsonify_data({})
 
+    indicators = []
+    sightings = []
+    relationships = []
+
+    for output in vision_one_outputs:
+        items = output.get("items", [])
+        observable = output.get("observable")
+        for entry in items:
+            # output_indicators = entry.get("indicators")
+            sightings.append(extract_sightings(entry, observable, host, api_token))
+            # if output_indicators:
+            #     indicators.extend(extract_indicators(output_indicators))
+            #     relationships.extend(extract_relationships(entry))
+
+    # return vision_one_outputs
+
+    relay_output = {}
+
+    if sightings:
+        relay_output["sightings"] = format_docs(sightings)
     return jsonify_data(relay_output)
 
 
